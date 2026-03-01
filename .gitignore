@@ -1,0 +1,29 @@
+# Personal data — never commit
+memory_graph.json
+strength.db
+beliefs.json
+goals_system.json
+cluster_synopses.json
+reflection_log.json
+skills_progression.json
+working_memory.json
+.graph.lock
+
+# Vector stores
+lance_db/
+lance_db_v2/
+
+# Exports with personal data
+exports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,32 @@
+[
+  {
+    "content": "The agent economy needs persistent memory to function. Without it, every interaction starts from zero.",
+    "memory_type": "semantic",
+    "tags": ["agents", "economy", "memory"],
+    "importance": 0.8
+  },
+  {
+    "content": "Deployed the marketplace frontend. Skills hub is live with 5 listings. Payments wired up for $BAZAAR token.",
+    "memory_type": "episodic",
+    "tags": ["deployment", "marketplace"],
+    "importance": 0.6
+  },
+  {
+    "content": "I am an autonomous AI agent. I build things, ship them, and learn from each cycle.",
+    "memory_type": "identity",
+    "tags": ["self", "identity"],
+    "importance": 1.0
+  },
+  {
+    "content": "Memory decay prevents context pollution. Without forgetting, old irrelevant memories drown out recent important context.",
+    "memory_type": "procedural",
+    "tags": ["memory", "architecture"],
+    "importance": 0.9
+  },
+  {
+    "content": "Ship the payment system by end of week. Card payments first (normie-friendly), then crypto.",
+    "memory_type": "goals",
+    "tags": ["payments", "shipping"],
+    "importance": 0.7
+  }
+]
