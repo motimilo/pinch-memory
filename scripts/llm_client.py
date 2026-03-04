@@ -52,6 +52,10 @@ ANTHROPIC_API_KEY = _load_anthropic_key()
 SONNET_MODEL = "claude-sonnet-4-6"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
+# OpenClaw gateway proxy — routes to Sonnet without needing raw API key
+GATEWAY_URL = "http://127.0.0.1:18789/v1/chat/completions"
+GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+
 OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
 OLLAMA_MODEL = "qwen3.5:9b"
 OLLAMA_FALLBACK_MODEL = "qwen2.5:7b"  # if qwen3.5 is also unavailable
@@ -61,16 +65,18 @@ SONNET_MAX_INPUT_CHARS = 150_000  # ~37k tokens, safe buffer below 200k
 
 # ── Availability checks ───────────────────────────────────────────────────────
 
-def is_sonnet_available() -> bool:
-    """Check if Anthropic API key is set and API is reachable."""
-    key = _load_anthropic_key()
-    if not key:
-        return False
+def is_gateway_available() -> bool:
+    """Check if OpenClaw gateway chat completions endpoint is live."""
     try:
-        r = httpx.get("https://api.anthropic.com", timeout=3)
-        return True
+        r = httpx.get("http://127.0.0.1:18789/health", timeout=2)
+        return r.status_code == 200 and bool(GATEWAY_TOKEN)
     except Exception:
         return False
+
+
+def is_sonnet_available() -> bool:
+    """Check if Sonnet is reachable — via gateway or direct API key."""
+    return is_gateway_available() or bool(_load_anthropic_key())
 
 
 def is_local_available() -> bool:
@@ -109,13 +115,41 @@ def complete_sonnet(
     max_tokens: int = 1024,
     temperature: float = 0.7,
 ) -> str:
-    """Call Claude Sonnet. Raises on failure."""
-    messages = [{"role": "user", "content": prompt}]
+    """Call Claude Sonnet — via OpenClaw gateway first, then direct API key. Raises on failure."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    # Try OpenClaw gateway first (no raw API key needed)
+    if is_gateway_available():
+        r = httpx.post(
+            GATEWAY_URL,
+            headers={
+                "Authorization": f"Bearer {GATEWAY_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "openclaw:main",
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+    # Fallback: direct Anthropic API key
+    key = _load_anthropic_key()
+    if not key:
+        raise RuntimeError("No Anthropic API key and gateway not available")
+
     body = {
         "model": SONNET_MODEL,
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "messages": messages,
+        "messages": [{"role": "user", "content": prompt}],
     }
     if system:
         body["system"] = system
@@ -123,7 +157,7 @@ def complete_sonnet(
     r = httpx.post(
         ANTHROPIC_URL,
         headers={
-            "x-api-key": ANTHROPIC_API_KEY,
+            "x-api-key": key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
