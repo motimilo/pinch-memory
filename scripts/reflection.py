@@ -33,7 +33,11 @@ from memory_graph import (
     get_db, add_memory, recall, get_stats,
     add_bond, load_graph, save_graph, get_all_strengths
 )
-from local_llm import is_available, complete
+try:
+    from llm_client import complete, is_sonnet_available, is_local_available
+    is_available = lambda: is_sonnet_available() or is_local_available()
+except ImportError:
+    from local_llm import is_available, complete
 try:
     from skills_progression import record_learning_event, assess_skill_from_experience
     SKILLS_AVAILABLE = True

@@ -37,6 +37,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from memory_graph import get_db, get_all_strengths
 from outcome import load_outcomes, export_for_improvement
+try:
+    from llm_client import complete as llm_complete, is_sonnet_available, is_local_available
+    llm_available = lambda: is_sonnet_available() or is_local_available()
+    HAS_LLM = True
+except Exception:
+    try:
+        from local_llm import is_available as llm_available, complete as llm_complete
+        HAS_LLM = True
+    except Exception:
+        HAS_LLM = False
+        llm_available = lambda: False
 
 MEMORY_DIR = Path.home() / ".openclaw" / "workspace" / "pinch-memory"
 WORKSPACE = Path.home() / ".openclaw" / "workspace"
@@ -86,8 +97,15 @@ def save_improve_log(log: list):
 def consolidate_outcomes(outcomes_by_domain: dict) -> list:
     """
     Analyze outcomes and extract patterns / lessons.
+    Uses local LLM when available for richer synthesis, falls back to pattern matching.
     Returns a list of proposed updates.
     """
+    use_llm = HAS_LLM and llm_available()
+    if use_llm:
+        print("   🧠 Local LLM available — using deep reflection mode")
+    else:
+        print("   📐 LLM offline — using pattern matching mode")
+
     proposals = []
 
     for domain, data in outcomes_by_domain.items():
@@ -95,45 +113,124 @@ def consolidate_outcomes(outcomes_by_domain: dict) -> list:
         failures = data.get("failures", [])
         partials = data.get("partials", [])
 
-        if not successes and not failures:
+        if not successes and not failures and not partials:
             continue
 
         # Extract patterns from failures
         for fail in failures:
-            # Turn each failure into a "warning" or "fix"
+            addition = _llm_failure_to_warning(fail, domain) if use_llm else _failure_to_warning(fail, domain)
             proposal = {
                 "id": f"{domain}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{abs(hash(fail)) % 10000}",
                 "type": "warning",
                 "domain": domain,
                 "trigger": fail,
-                "proposed_addition": _failure_to_warning(fail, domain),
+                "proposed_addition": addition,
                 "target_files": [str(f) for f in DOMAIN_TO_FILES.get(domain, [WORKSPACE / "MEMORY.md"])],
                 "created_at": datetime.now().isoformat(),
                 "status": "pending",
                 "source_outcome": "fail",
+                "synthesized_by": "llm" if use_llm else "pattern",
             }
             if proposal["proposed_addition"]:
                 proposals.append(proposal)
 
-        # Extract patterns from successes
-        if len(successes) >= 2:
-            # Multiple successes in a domain = there's a working pattern worth documenting
+        # Extract patterns from successes (2+ = worth documenting)
+        if len(successes) >= 2 or (len(successes) >= 1 and use_llm):
+            addition = _llm_successes_to_pattern(successes, domain, partials) if use_llm else _successes_to_pattern(successes, domain)
             combined = "; ".join(successes[-3:])
             proposal = {
                 "id": f"{domain}_{datetime.now().strftime('%Y%m%d%H%M%S')}_pattern",
                 "type": "pattern",
                 "domain": domain,
                 "trigger": combined,
-                "proposed_addition": _successes_to_pattern(successes, domain),
+                "proposed_addition": addition,
                 "target_files": [str(f) for f in DOMAIN_TO_FILES.get(domain, [WORKSPACE / "MEMORY.md"])],
                 "created_at": datetime.now().isoformat(),
                 "status": "pending",
                 "source_outcome": "success",
+                "synthesized_by": "llm" if use_llm else "pattern",
             }
             if proposal["proposed_addition"]:
                 proposals.append(proposal)
 
+        # LLM-only: cross-domain cleanup — consolidate noisy/redundant entries
+        if use_llm and (len(successes) + len(failures) + len(partials)) >= 3:
+            cleanup = _llm_cleanup_summary(successes, failures, partials, domain)
+            if cleanup:
+                proposals.append({
+                    "id": f"{domain}_{datetime.now().strftime('%Y%m%d%H%M%S')}_cleanup",
+                    "type": "cleanup",
+                    "domain": domain,
+                    "trigger": f"cleanup for {domain}",
+                    "proposed_addition": cleanup,
+                    "target_files": [str(f) for f in DOMAIN_TO_FILES.get(domain, [WORKSPACE / "MEMORY.md"])],
+                    "created_at": datetime.now().isoformat(),
+                    "status": "pending",
+                    "source_outcome": "mixed",
+                    "synthesized_by": "llm",
+                })
+
     return proposals
+
+
+# ============================================================
+# LLM-POWERED SYNTHESIS
+# ============================================================
+
+def _llm_failure_to_warning(fail: str, domain: str) -> str:
+    """Use LLM to generate a specific, actionable warning from a failure."""
+    try:
+        response = llm_complete(f"""An AI agent named PINCH encountered this failure:
+
+Domain: {domain}
+Failure: {fail}
+
+Write a concise warning note (2-3 sentences) for the agent's documentation.
+Format it as: ⚠️ [what went wrong] → [how to fix/avoid it next time]
+Be specific and actionable. No fluff.""", max_tokens=150, temperature=0.3)
+        return response.strip()
+    except Exception as e:
+        return _failure_to_warning(fail, domain)
+
+
+def _llm_successes_to_pattern(successes: list, domain: str, partials: list = None) -> str:
+    """Use LLM to synthesize a reusable pattern from successful outcomes."""
+    all_wins = successes + (partials or [])
+    try:
+        response = llm_complete(f"""An AI agent named PINCH had these successful outcomes:
+
+Domain: {domain}
+Successes:
+{chr(10).join(f'- {s}' for s in all_wins[-5:])}
+
+Synthesize the key reusable pattern or procedure these successes demonstrate.
+Format as: ✅ [pattern name]: [what works and why, 2-4 sentences]
+Be specific — include any important details like exact selectors, flags, formats, or sequences.""", max_tokens=200, temperature=0.4)
+        return response.strip()
+    except Exception:
+        return _successes_to_pattern(successes, domain)
+
+
+def _llm_cleanup_summary(successes: list, failures: list, partials: list, domain: str) -> str:
+    """Use LLM to write a clean consolidated summary for the domain — replaces noise with signal."""
+    all_outcomes = (
+        [f"✅ {s}" for s in successes] +
+        [f"❌ {f}" for f in failures] +
+        [f"⚡ {p}" for p in partials]
+    )
+    if len(all_outcomes) < 3:
+        return ""
+    try:
+        response = llm_complete(f"""Summarize what PINCH has learned about [{domain}] from these recent outcomes:
+
+{chr(10).join(all_outcomes[-8:])}
+
+Write a clean, structured summary (3-5 bullet points) distilling the key lessons.
+This will be added to the agent's persistent memory docs.
+Focus on durable, generalizable knowledge — not one-off events.""", max_tokens=300, temperature=0.4)
+        return f"📚 Consolidated lessons for [{domain.upper()}]:\n{response.strip()}"
+    except Exception:
+        return ""
 
 
 def _failure_to_warning(fail: str, domain: str) -> str:
