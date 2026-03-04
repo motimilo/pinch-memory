@@ -21,14 +21,37 @@ LLM_BASE = "http://localhost:1234/v1"
 EMBED_MODEL = "text-embedding-nomic-embed-text-v1.5"
 CHAT_MODEL = "qwen2.5-14b-instruct-mlx"
 
+# Ollama fallback (always-on, no model loading needed)
+OLLAMA_BASE = "http://localhost:11434/api"
+OLLAMA_CHAT_MODEL = "qwen3.5:9b"  # thinking model — use max_tokens=8000 to leave room for CoT + response
+
 
 def is_available() -> bool:
-    """Check if local LLM server is running."""
+    """Check if any local LLM server is running (LM Studio or Ollama)."""
+    # Try LM Studio first
     try:
         r = httpx.get(f"{LLM_BASE}/models", timeout=2)
+        if r.status_code == 200:
+            return True
+    except:
+        pass
+    # Fallback: Ollama
+    try:
+        r = httpx.get(f"{OLLAMA_BASE.replace('/api', '')}/api/tags", timeout=2)
         return r.status_code == 200
     except:
         return False
+
+
+def _using_ollama() -> bool:
+    """Check if we should use Ollama (LM Studio not available)."""
+    try:
+        r = httpx.get(f"{LLM_BASE}/models", timeout=1)
+        if r.status_code == 200 and r.json().get("data"):
+            return False
+    except:
+        pass
+    return True
 
 
 def get_embedding(text: str) -> list[float]:
@@ -42,20 +65,46 @@ def get_embedding(text: str) -> list[float]:
     return r.json()["data"][0]["embedding"]
 
 
+def _strip_thinking(text: str) -> str:
+    """Strip <think>...</think> chain-of-thought tags from Qwen3 responses."""
+    import re
+    # Remove thinking blocks entirely
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
 def complete(prompt: str, max_tokens: int = 500, temperature: float = 0.7) -> str:
-    """Get completion from local Qwen model."""
-    r = httpx.post(
-        f"{LLM_BASE}/chat/completions",
-        json={
-            "model": CHAT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature
-        },
-        timeout=60
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    """Get completion from local LLM — tries LM Studio first, falls back to Ollama."""
+    if not _using_ollama():
+        # LM Studio (OpenAI-compatible)
+        r = httpx.post(
+            f"{LLM_BASE}/chat/completions",
+            json={
+                "model": CHAT_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            },
+            timeout=120
+        )
+        r.raise_for_status()
+        return _strip_thinking(r.json()["choices"][0]["message"]["content"])
+    else:
+        # Ollama — Qwen3.5:9b wraps CoT in <think>...</think> before the actual answer
+        # Set high num_predict (thinking needs ~1000-3000 tokens before response)
+        r = httpx.post(
+            f"{OLLAMA_BASE}/v1/chat/completions",
+            json={
+                "model": OLLAMA_CHAT_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max(max_tokens, 8000),  # always give room for thinking + response
+                "temperature": temperature,
+            },
+            timeout=180
+        )
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"]
+        return _strip_thinking(content)
 
 
 # ============================================================
