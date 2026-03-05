@@ -307,6 +307,39 @@ def list_memories():
 
 
 
+@app.route('/add', methods=['POST'])
+def add_memory():
+    """Add a memory. Called by RADAR, agents, and external tools."""
+    data = request.json or {}
+    content = data.get('content', '')
+    category = data.get('category', data.get('type', 'episodic'))
+    importance = float(data.get('importance', 0.5))
+    tags = data.get('tags', [])
+
+    if not content:
+        return jsonify({'error': 'content required'}), 400
+
+    mg = get_memory_graph()
+    mem_id = mg.add_memory(
+        content=content,
+        category=category,
+        metadata={"tags": tags, "importance": importance},
+    )
+
+    # Sync to Engram cognitive layer
+    eng = get_engram()
+    if eng:
+        try:
+            eng.add(content, type=category, importance=importance)
+        except Exception:
+            pass
+
+    # Invalidate session cache (new memory might affect results)
+    _session_cache.clear()
+
+    return jsonify({'id': mem_id, 'status': 'added', 'category': category})
+
+
 @app.route('/reward', methods=['POST'])
 def reward():
     data = request.json or {}
