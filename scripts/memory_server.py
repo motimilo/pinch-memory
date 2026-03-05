@@ -8,6 +8,7 @@
 #     "pandas>=2.0.0",
 #     "networkx>=3.0",
 #     "flask>=3.0.0",
+#     "engramai[sentence-transformers]>=0.1.0",
 # ]
 # ///
 """
@@ -22,6 +23,39 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+# ── Engram cognitive mechanics (reward, forget, pin, session cache) ───────────
+_engram_instance = None
+_engram_db_path = str(Path.home() / ".openclaw" / "workspace" / "pinch-memory" / "engram.db")
+
+def get_engram():
+    global _engram_instance
+    if _engram_instance is None:
+        try:
+            from engram import Memory as EngramMemory
+            _engram_instance = EngramMemory(_engram_db_path)
+            print("✓ Engram cognitive layer loaded")
+        except Exception as e:
+            print(f"⚠ Engram not available: {e}")
+    return _engram_instance
+
+# Session cache (skip DB on repeated queries)
+import hashlib, time as _time
+_session_cache = {}
+SESSION_TTL = 300
+
+def _cache_get(query, session_id):
+    key = hashlib.md5(f"{session_id}:{query[:50]}".encode()).hexdigest()
+    if key in _session_cache:
+        ts, results = _session_cache[key]
+        if _time.time() - ts < SESSION_TTL:
+            return results
+    return None
+
+def _cache_set(query, session_id, results):
+    key = hashlib.md5(f"{session_id}:{query[:50]}".encode()).hexdigest()
+    _session_cache[key] = (_time.time(), results)
 
 app = Flask(__name__)
 
@@ -142,10 +176,21 @@ def stats():
         for cat in df['category']:
             categories[cat] = categories.get(cat, 0) + 1
     
+    eng = get_engram()
+    engram_stats = {}
+    if eng:
+        try:
+            s = eng.stats()
+            engram_stats = {'total': s.get('total_memories', 0), 'by_type': s.get('by_type', {})}
+        except Exception:
+            pass
+
     return jsonify({
         'total_memories': mem_count,
         'total_bonds': G.number_of_edges(),
-        'categories': categories
+        'categories': categories,
+        'engram': engram_stats,
+        'session_cache_entries': len(_session_cache),
     })
 
 @app.route('/search', methods=['POST'])
@@ -167,9 +212,15 @@ def search():
     limit = data.get('limit', 5)
     mem_type = data.get('type')
     min_strength = data.get('min_strength', 0.3)
-    
+    session_id = data.get('session_id', 'default')
+
     if not query or len(query) < 5:
         return jsonify({'error': 'Query must be at least 5 characters', 'memories': []})
+
+    # Session cache — skip DB on repeated queries within same session
+    cached = _cache_get(query, session_id)
+    if cached is not None:
+        return jsonify({'memories': cached, 'query': query, 'found': len(cached), 'cached': True})
     
     mg = get_memory_graph()
     model = get_embedding_model()
@@ -186,8 +237,9 @@ def search():
     
     filtered = []
     for r in results:
-        # Type filter
-        if mem_type and r.get("type") != mem_type:
+        # Type filter — stored as 'category' field
+        mem_category = r.get("category") or r.get("type", "unknown")
+        if mem_type and mem_category != mem_type:
             continue
         
         # Strength filter
@@ -200,7 +252,7 @@ def search():
         
         filtered.append({
             "content": r.get("content", ""),
-            "type": r.get("type", "unknown"),
+            "type": mem_category,
             "score": round(combined_score, 3),
             "similarity": round(similarity, 3),
             "strength": round(strength, 3),
@@ -209,7 +261,9 @@ def search():
         })
     
     filtered.sort(key=lambda x: x["score"], reverse=True)
-    return jsonify({'memories': filtered[:limit], 'query': query, 'found': len(filtered)})
+    results = filtered[:limit]
+    _cache_set(query, session_id, results)
+    return jsonify({'memories': results, 'query': query, 'found': len(filtered), 'cached': False})
 
 
 @app.route('/list', methods=['GET'])
@@ -251,6 +305,48 @@ def list_memories():
     
     return jsonify({'memories': memories, 'total': total})
 
+
+
+@app.route('/reward', methods=['POST'])
+def reward():
+    data = request.json or {}
+    reason = data.get('reason', 'positive feedback')
+    n = int(data.get('recent_n', 3))
+    eng = get_engram()
+    if eng:
+        eng.reward(reason, recent_n=n)
+    return jsonify({'status': 'rewarded', 'reason': reason, 'n': n})
+
+@app.route('/forget', methods=['POST'])
+def forget():
+    data = request.json or {}
+    threshold = float(data.get('threshold', 0.1))
+    pruned = 0
+    try:
+        mg = get_memory_graph()
+        pruned = mg.prune_weak_memories(threshold=threshold)
+    except Exception as e:
+        pass
+    eng = get_engram()
+    if eng:
+        eng.forget(threshold=threshold)
+    return jsonify({'status': 'pruned', 'count': pruned, 'threshold': threshold})
+
+@app.route('/pin', methods=['POST'])
+def pin():
+    data = request.json or {}
+    content = data.get('content', '')
+    eng = get_engram()
+    if eng and content:
+        results = eng.recall(content, limit=1)
+        if results:
+            eng.pin(results[0]['id'])
+    return jsonify({'status': 'pinned'})
+
+@app.route('/session/clear', methods=['POST'])
+def clear_session():
+    _session_cache.clear()
+    return jsonify({'status': 'cleared'})
 
 if __name__ == '__main__':
     # Preload everything
